@@ -6,7 +6,7 @@ use tokio::process::Command;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Rust FFmpeg NVENC Batch Encoder", long_about = None)]
 struct Args {
-    /// Input video file paths (supports multiple files from different directories)
+    /// Input video file paths or folder paths
     #[arg(short, long, required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 
@@ -27,22 +27,28 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // 1. Discover all actual video files from the provided inputs (files or folders)
+    let mut files_to_process = Vec::new();
+    for input_path in args.inputs {
+        collect_video_files(input_path, &mut files_to_process);
+    }
+
+    if files_to_process.is_empty() {
+        eprintln!("⚠️ No valid video files found to process.");
+        return Ok(());
+    }
+
     println!(
         "🚀 Starting batch processing of {} files...",
-        args.inputs.len()
+        files_to_process.len()
     );
 
-    for input_path in args.inputs {
-        if !input_path.exists() {
-            eprintln!("⚠️ File not found: {:?}, skipping.", input_path);
-            continue;
-        }
-
+    // 2. Process the gathered files
+    for input_path in files_to_process {
         // Determine the output directory dynamically:
-        // Use the explicit output_dir if provided, otherwise fallback to the input file's parent folder.
         let target_dir = match &args.output_dir {
-            Some(dir) => dir.clone(), // If you set -o, use that exact folder for everything
-            None => input_path.parent().unwrap_or(Path::new(".")).to_path_buf(), // If not, use the input file's folder
+            Some(dir) => dir.clone(), 
+            None => input_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
         };
 
         // Ensure the determined target directory exists
@@ -109,4 +115,24 @@ fn build_output_path(input: &Path, out_dir: &Path, suffix: &str, ext: &str) -> P
     let stem = input.file_stem().unwrap().to_string_lossy();
     let new_filename = format!("{}{}.{}", stem, suffix, ext);
     out_dir.join(new_filename)
+}
+
+/// Recursively scans directories for files matching common video extensions
+fn collect_video_files(path: PathBuf, files: &mut Vec<PathBuf>) {
+    // List of standard video extensions to look for
+    let valid_extensions = ["mp4", "mkv", "mov", "avi", "flv", "webm", "m4v", "wmv"];
+
+    if path.is_file() {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if valid_extensions.contains(&ext.to_lowercase().as_str()) {
+                files.push(path);
+            }
+        }
+    } else if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                collect_video_files(entry.path(), files);
+            }
+        }
+    }
 }
