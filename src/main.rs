@@ -10,7 +10,7 @@ struct Args {
     #[arg(short, long, required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 
-    /// Destination directory for output files (Defaults to the input file's directory if not set)
+    /// Destination directory for output files (Defaults to a subdirectory inside the input file's parent directory, named after the parent)
     #[arg(short, long)]
     output_dir: Option<PathBuf>,
 
@@ -48,7 +48,11 @@ async fn main() -> anyhow::Result<()> {
         // Determine the output directory dynamically:
         let target_dir = match &args.output_dir {
             Some(dir) => dir.clone(), 
-            None => input_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            None => {
+                let parent = input_path.parent().unwrap_or(Path::new("."));
+                let dir_name = parent.file_name().unwrap();
+                parent.join(dir_name)
+            }
         };
 
         // Ensure the determined target directory exists
