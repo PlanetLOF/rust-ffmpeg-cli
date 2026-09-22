@@ -10,7 +10,7 @@ struct Args {
     #[arg(short, long, required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 
-    /// Destination directory for output files (Defaults to a subdirectory inside the input file's parent directory, named after the parent)
+    /// Base destination directory for output files (Defaults to `output` in the current directory)
     #[arg(short, long)]
     output_dir: Option<PathBuf>,
 
@@ -46,14 +46,15 @@ async fn main() -> anyhow::Result<()> {
     // 2. Process the gathered files
     for input_path in files_to_process {
         // Determine the output directory dynamically:
-        let target_dir = match &args.output_dir {
-            Some(dir) => dir.clone(), 
-            None => {
-                let parent = input_path.parent().unwrap_or(Path::new("."));
-                let dir_name = parent.file_name().unwrap();
-                parent.join(dir_name)
-            }
+        let base_dir = match &args.output_dir {
+            Some(dir) => dir.clone(),
+            None => PathBuf::from("output"),
         };
+        let parent_name = input_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap_or(Path::new(".").as_os_str());
+        let target_dir = base_dir.join(parent_name);
 
         // Ensure the determined target directory exists
         if !target_dir.exists() {
@@ -64,37 +65,48 @@ async fn main() -> anyhow::Result<()> {
         let output_path =
             build_output_path(&input_path, &target_dir, &args.suffix, &args.extension);
 
-        println!("\n🎬 Processing: {:?}", input_path);
+        // Detect source bit depth and match the encoder to it, avoiding the
+        // broken 8->10 bit conversion in scale_cuda (green output on NVENC)
+        let is_10bit = match probe_pixel_format(&input_path).await {
+            Some(pix_fmt) => is_10bit_pix_fmt(&pix_fmt),
+            None => false,
+        };
+        let scale_format = if is_10bit { "p010le" } else { "nv12" };
+        let profile = if is_10bit { "main10" } else { "main" };
+
+        println!(
+            "\n🎬 Processing: {:?} ({} bit)",
+            input_path,
+            if is_10bit { "10" } else { "8" }
+        );
         println!("➡️ Saving to:   {:?}", output_path);
 
         // Construct the FFmpeg command
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(&[
-            "-y",
-            "-hwaccel",
-            "cuda",
-            "-hwaccel_output_format",
-            "cuda",
-            "-i",
-            input_path.to_str().unwrap(),
-            "-vf",
-            "scale_cuda=format=p010le",
-            "-c:v",
-            "hevc_nvenc",
-            "-profile:v",
-            "main10",
-            "-preset",
-            "slow",
-            "-rc",
-            "constqp",
-            "-cq",
-            "22",
-            "-c:a",
-            "copy",
-            "-map_metadata",
-            "0",
-            output_path.to_str().unwrap(),
-        ]);
+        cmd.arg("-y")
+            .arg("-hwaccel")
+            .arg("cuda")
+            .arg("-hwaccel_output_format")
+            .arg("cuda")
+            .arg("-i")
+            .arg(input_path.to_str().unwrap())
+            .arg("-vf")
+            .arg(format!("scale_cuda=format={}", scale_format))
+            .arg("-c:v")
+            .arg("hevc_nvenc")
+            .arg("-profile:v")
+            .arg(profile)
+            .arg("-preset")
+            .arg("slow")
+            .arg("-rc")
+            .arg("constqp")
+            .arg("-cq")
+            .arg("22")
+            .arg("-c:a")
+            .arg("copy")
+            .arg("-map_metadata")
+            .arg("0")
+            .arg(output_path.to_str().unwrap());
 
         // Inherit stdout/stderr for live FFmpeg progress
         cmd.stdout(Stdio::inherit());
@@ -139,4 +151,35 @@ fn collect_video_files(path: PathBuf, files: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Probes the pixel format of the first video stream using ffprobe
+async fn probe_pixel_format(path: &Path) -> Option<String> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=pix_fmt",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path.to_str()?,
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let pix_fmt = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!pix_fmt.is_empty()).then_some(pix_fmt)
+}
+
+/// Returns true for 10-bit pixel formats (e.g. yuv420p10le, p010le)
+fn is_10bit_pix_fmt(pix_fmt: &str) -> bool {
+    pix_fmt.contains("p10") || pix_fmt.contains("10le") || pix_fmt.contains("10be")
 }

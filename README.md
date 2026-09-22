@@ -25,7 +25,7 @@ rust-ffmpeg-cli [OPTIONS] --inputs <INPUTS>...
 | Flag | Long | Default | Description |
 |------|------|---------|-------------|
 | `-i` | `--inputs` | *(required)* | Input video file paths or folder paths |
-| `-o` | `--output-dir` | `<parent>/<parent_name>/` | Destination directory for output files |
+| `-o` | `--output-dir` | `output/<parent_name>/` | Base destination directory for output files |
 | `-e` | `--extension` | `mkv` | Custom output file extension (e.g., `mkv`, `mp4`) |
 | `-s` | `--suffix` | `_enc` | Custom suffix appended to the input file name |
 | `-h` | `--help` | | Print help |
@@ -33,11 +33,11 @@ rust-ffmpeg-cli [OPTIONS] --inputs <INPUTS>...
 
 ### Examples
 
-Encode a single file (output goes to a subdirectory named after the parent):
+Encode a single file (output goes to `output/` with a subdirectory named after the parent):
 
 ```bash
 # input:  /home/user/videos/video.mp4
-# output: /home/user/videos/videos/video_enc.mkv
+# output: output/videos/video_enc.mkv
 rust-ffmpeg-cli -i video.mp4
 ```
 
@@ -57,6 +57,7 @@ Specify output directory and extension:
 
 ```bash
 rust-ffmpeg-cli -i video.mp4 -o /output/ -e mp4
+# output: /output/videos/video_enc.mp4
 ```
 
 Custom suffix:
@@ -71,10 +72,10 @@ rust-ffmpeg-cli -i video.mp4 -s "_h265"
 Output files follow the pattern:
 
 ```
-{parent_dir}/{parent_dir_name}/{original_stem}{suffix}.{extension}
+{base_dir}/{parent_dir_name}/{original_stem}{suffix}.{extension}
 ```
 
-For example, with defaults: `/home/user/videos/movie.mp4` becomes `/home/user/videos/videos/movie_enc.mkv`.
+Where `{base_dir}` defaults to `output` (relative to the current working directory) unless overridden with `-o`. For example, with defaults: `movies/movie.mp4` becomes `output/movies/movie_enc.mkv`.
 
 ## Encoding Profile
 
