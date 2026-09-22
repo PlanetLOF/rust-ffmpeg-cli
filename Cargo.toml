@@ -5,5 +5,13 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
-tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
+# default-features = false: the default `device` feature pulls in libavdevice
+# (and its avdevice-*.dll) which we never use. We only need demux/mux (format),
+# filters (filter), and the software resample/scale helpers.
+ffmpeg-next = { version = "8.1.0", default-features = false, features = [
+    "filter",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
