@@ -16,17 +16,17 @@
 //! safe `ffmpeg-next` API, so they use raw FFI through `ffmpeg::ffi`
 //! (a.k.a. `ffmpeg_sys_next`).
 
-use std::ffi::{c_int, CString};
+use std::ffi::{CString, c_int};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Parser;
 
-use ffmpeg_next as ffmpeg;
 use ffmpeg::ffi::*;
-use ffmpeg::{codec, format, frame, log, media, Dictionary, Error, Packet, Rational};
+use ffmpeg::{Dictionary, Error, Packet, Rational, codec, format, frame, log, media};
+use ffmpeg_next as ffmpeg;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -158,7 +158,8 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&target_dir)?;
         }
 
-        let output_path = build_output_path(&input_path, &target_dir, &args.suffix, &args.extension);
+        let output_path =
+            build_output_path(&input_path, &target_dir, &args.suffix, &args.extension);
 
         println!("\n🎬 Processing: {:?}", input_path);
         match process_video(&input_path, &output_path, mode, args.cpu_codec) {
@@ -206,7 +207,9 @@ fn process_video(
 
     let pipeline_desc = match (mode, cpu_codec) {
         (TranscodeMode::Gpu, _) => format!("scale_cuda → {scale_format} | hevc_nvenc ({profile})"),
-        (TranscodeMode::Cpu, CpuCodec::Hevc) => format!("format → {scale_format} | libx265 ({profile})"),
+        (TranscodeMode::Cpu, CpuCodec::Hevc) => {
+            format!("format → {scale_format} | libx265 ({profile})")
+        }
         (TranscodeMode::Cpu, CpuCodec::Av1) => format!("format → {scale_format} | libsvtav1"),
     };
     println!(
@@ -251,8 +254,15 @@ fn process_video(
 
         if ist_index == vindex {
             // Re-encode the (best) video stream (NVENC on GPU, libx265/svtav1 on CPU).
-            let mut pipe =
-                VideoPipeline::new(&ist, ost_index, width, height, &src_pix_name, mode, cpu_codec)?;
+            let mut pipe = VideoPipeline::new(
+                &ist,
+                ost_index,
+                width,
+                height,
+                &src_pix_name,
+                mode,
+                cpu_codec,
+            )?;
             pipe.input_time_base = video_stream_tb;
             pipeline = Some(pipe);
 
@@ -295,9 +305,7 @@ fn process_video(
         }
 
         if ist_index == vindex {
-            let pipe = pipeline
-                .as_mut()
-                .expect("video pipeline not initialized");
+            let pipe = pipeline.as_mut().expect("video pipeline not initialized");
             if !primed {
                 pipe.decoder.send_packet(&packet)?;
                 let mut first = frame::Video::empty();
@@ -573,7 +581,11 @@ impl VideoPipeline {
     }
 
     /// GPU path: CUDA frames through `scale_cuda` into an NVENC encoder.
-    fn prepare_gpu(&mut self, octx: &mut format::context::Output, global_header: bool) -> Result<()> {
+    fn prepare_gpu(
+        &mut self,
+        octx: &mut format::context::Output,
+        global_header: bool,
+    ) -> Result<()> {
         // The decoder allocated its hardware frames context when the first
         // frame was decoded; the filter source must use that same pool.
         let dec_hw_frames: *mut AVBufferRef = unsafe { (*self.decoder.as_mut_ptr()).hw_frames_ctx };
@@ -712,8 +724,9 @@ impl VideoPipeline {
             let encoder_codec = ffmpeg::encoder::find_by_name("hevc_nvenc")
                 .ok_or_else(|| anyhow!("hevc_nvenc encoder not found in this FFmpeg build"))?;
 
-            let mut encoder =
-                codec::context::Context::new_with_codec(encoder_codec).encoder().video()?;
+            let mut encoder = codec::context::Context::new_with_codec(encoder_codec)
+                .encoder()
+                .video()?;
 
             encoder.set_width(self.decoder.width());
             encoder.set_height(self.decoder.height());
@@ -766,7 +779,11 @@ impl VideoPipeline {
     /// GPU path — the subtle parts here are that the software decoder's
     /// *actual* pixel format must be given to the buffer source, and the
     /// `format` filter converts it to what the encoder wants.
-    fn prepare_cpu(&mut self, octx: &mut format::context::Output, global_header: bool) -> Result<()> {
+    fn prepare_cpu(
+        &mut self,
+        octx: &mut format::context::Output,
+        global_header: bool,
+    ) -> Result<()> {
         let mut graph = unsafe { avfilter_graph_alloc() };
         if graph.is_null() {
             bail!("out of memory allocating filter graph");
@@ -877,8 +894,9 @@ impl VideoPipeline {
             let encoder_codec = ffmpeg::encoder::find_by_name(encoder_name)
                 .ok_or_else(|| anyhow!("{encoder_name} encoder not found in this FFmpeg build"))?;
 
-            let mut encoder =
-                codec::context::Context::new_with_codec(encoder_codec).encoder().video()?;
+            let mut encoder = codec::context::Context::new_with_codec(encoder_codec)
+                .encoder()
+                .video()?;
 
             encoder.set_width(self.decoder.width());
             encoder.set_height(self.decoder.height());
@@ -904,14 +922,14 @@ impl VideoPipeline {
             let mut opts = Dictionary::new();
             match self.cpu_codec {
                 CpuCodec::Hevc => {
-                    opts.set("preset", "slow");
-                    opts.set("crf", "22");
+                    opts.set("preset", "ultrafast");
+                    opts.set("crf", "24");
                     opts.set("profile", self.profile.as_str());
                     // Keep x265's banner/statistics spam out of the batch log.
                     opts.set("x265-params", "log-level=error");
                 }
                 CpuCodec::Av1 => {
-                    opts.set("preset", "6");
+                    opts.set("preset", "8");
                     opts.set("crf", "32");
                 }
             }
@@ -973,11 +991,7 @@ impl VideoPipeline {
     }
 
     /// Flushes the decoder, filter graph and encoder at end of stream.
-    fn flush(
-        &mut self,
-        octx: &mut format::context::Output,
-        ost_time_base: Rational,
-    ) -> Result<()> {
+    fn flush(&mut self, octx: &mut format::context::Output, ost_time_base: Rational) -> Result<()> {
         self.decoder.send_eof()?;
         self.drain_decoded_frames(octx, ost_time_base)?;
         self.finish_flush(octx, ost_time_base)
@@ -1157,7 +1171,9 @@ fn source_pixel_format_name(stream: &format::stream::Stream) -> String {
         if name.is_null() {
             "unknown".to_string()
         } else {
-            std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }
