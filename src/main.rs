@@ -3,14 +3,18 @@
 //!
 //! Per input file it:
 //!   1. demuxes with libavformat,
-//!   2. decodes the video stream with CUDA hardware acceleration,
-//!   3. runs a `scale_cuda` filter graph (format conversion stays on the GPU),
-//!   4. encodes with `hevc_nvenc` (constqp @ 22, preset slow, main/main10),
+//!   2. decodes the video stream (CUDA hardware decode on the GPU path,
+//!      software decode in CPU fallback mode),
+//!   3. runs a filter graph (`scale_cuda` on GPU, `format` on CPU),
+//!   4. encodes — `hevc_nvenc` (constqp @ 22, preset slow, main/main10) on GPU,
+//!      or `libx265`/`libsvtav1` when falling back to software,
 //!   5. stream-copies audio/subtitles (like the old shell-out version did).
 //!
-//! The hardware parts (CUDA device, hardware frame contexts, filter graph with
-//! hardware frames) are not exposed by the safe `ffmpeg-next` API, so they use
-//! raw FFI through `ffmpeg::ffi` (a.k.a. `ffmpeg_sys_next`).
+//! `--mode auto` probes for a CUDA-capable NVIDIA GPU once at startup and uses
+//! CPU encoding when none is found. The hardware parts (CUDA device, hardware
+//! frame contexts, filter graph with hardware frames) are not exposed by the
+//! safe `ffmpeg-next` API, so they use raw FFI through `ffmpeg::ffi`
+//! (a.k.a. `ffmpeg_sys_next`).
 
 use std::ffi::{c_int, CString};
 use std::path::{Path, PathBuf};
@@ -47,6 +51,41 @@ struct Args {
     /// Custom suffix to append to the input file name (e.g., '_enc')
     #[arg(short, long, default_value = "_enc")]
     suffix: String,
+
+    /// Encoding mode: auto (detect NVIDIA/CUDA), cuda, or cpu (software fallback)
+    #[arg(long, value_enum, default_value_t = Mode::Auto)]
+    mode: Mode,
+
+    /// Software encoder codec used when running in CPU mode
+    #[arg(long, value_enum, default_value_t = CpuCodec::Hevc)]
+    cpu_codec: CpuCodec,
+}
+
+/// CLI choices for the encoding pipeline.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Probe for a CUDA-capable NVIDIA GPU and fall back to CPU if absent
+    Auto,
+    /// Always use CUDA hardware decode + NVENC (fails if no NVIDIA GPU)
+    Cuda,
+    /// Always use the software (CPU) pipeline
+    Cpu,
+}
+
+/// Software (CPU) encoder to use in place of NVENC.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuCodec {
+    /// libx265 — HEVC, the same codec as the GPU path (crf 22, preset slow)
+    Hevc,
+    /// libsvtav1 — AV1 (crf 32, preset 6)
+    Av1,
+}
+
+/// The pipeline selected for the whole batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscodeMode {
+    Gpu,
+    Cpu,
 }
 
 fn main() -> Result<()> {
@@ -54,6 +93,20 @@ fn main() -> Result<()> {
 
     ffmpeg::init().context("failed to initialize FFmpeg")?;
     log::set_level(log::Level::Warning);
+
+    // Decide the pipeline once for the whole batch: in `auto` mode probe for a
+    // CUDA device; `cuda`/`cpu` force a specific path.
+    let mode = match args.mode {
+        Mode::Cuda => TranscodeMode::Gpu,
+        Mode::Cpu => TranscodeMode::Cpu,
+        Mode::Auto => {
+            if cuda_device_available()? {
+                TranscodeMode::Gpu
+            } else {
+                TranscodeMode::Cpu
+            }
+        }
+    };
 
     // 1. Discover all actual video files from the provided inputs (files or folders)
     let mut files_to_process = Vec::new();
@@ -70,6 +123,23 @@ fn main() -> Result<()> {
         "🚀 Starting batch processing of {} files...",
         files_to_process.len()
     );
+
+    let encoder_label = match (mode, args.cpu_codec) {
+        (TranscodeMode::Gpu, _) => "hevc_nvenc",
+        (TranscodeMode::Cpu, CpuCodec::Hevc) => "libx265 (HEVC)",
+        (TranscodeMode::Cpu, CpuCodec::Av1) => "libsvtav1 (AV1)",
+    };
+    match mode {
+        TranscodeMode::Gpu => println!("🎛 Pipeline: CUDA (GPU) | {encoder_label}"),
+        TranscodeMode::Cpu => println!(
+            "🎛 Pipeline: CPU (software) | {encoder_label}{}",
+            if args.mode == Mode::Auto {
+                " — NVIDIA not detected, falling back to software"
+            } else {
+                ""
+            }
+        ),
+    }
 
     // 2. Process the gathered files
     for input_path in files_to_process {
@@ -91,7 +161,7 @@ fn main() -> Result<()> {
         let output_path = build_output_path(&input_path, &target_dir, &args.suffix, &args.extension);
 
         println!("\n🎬 Processing: {:?}", input_path);
-        match process_video(&input_path, &output_path) {
+        match process_video(&input_path, &output_path, mode, args.cpu_codec) {
             Ok(()) => println!("✅ Successfully encoded: {:?}", output_path),
             Err(e) => eprintln!("❌ Failed to encode {:?}:\n   {:#}", input_path, e),
         }
@@ -102,7 +172,12 @@ fn main() -> Result<()> {
 }
 
 /// Encodes a single input video into `output_path`.
-fn process_video(input: &Path, output: &Path) -> Result<()> {
+fn process_video(
+    input: &Path,
+    output: &Path,
+    mode: TranscodeMode,
+    cpu_codec: CpuCodec,
+) -> Result<()> {
     let mut ictx = format::input(input)
         .with_context(|| format!("could not open input `{}`", input.display()))?;
 
@@ -113,22 +188,32 @@ fn process_video(input: &Path, output: &Path) -> Result<()> {
     let vindex = video_stream.index();
     let video_stream_tb = video_stream.time_base();
 
-    // Detect the source bit depth and pick the scale_cuda output format and
-    // nvenc profile accordingly (avoids the broken 8->10 bit conversion in
-    // scale_cuda that produced green frames with NVENC).
+    // Detect the source bit depth and pick the scale output format and codec
+    // profile accordingly. On the GPU path that is NVENC's nv12/p010le (the 8->10
+    // bit conversion in scale_cuda is broken and produced green frames); on the
+    // CPU path the software `scale` filter converts to yuv420p/yuv420p10le.
     let src_pix_name = source_pixel_format_name(&video_stream);
     let is_10bit = is_10bit_pix_fmt(&src_pix_name);
-    let scale_format = if is_10bit { "p010le" } else { "nv12" };
+    let scale_format = match (mode, is_10bit) {
+        (TranscodeMode::Gpu, true) => "p010le",
+        (TranscodeMode::Gpu, false) => "nv12",
+        (TranscodeMode::Cpu, true) => "yuv420p10le",
+        (TranscodeMode::Cpu, false) => "yuv420p",
+    };
     let profile = if is_10bit { "main10" } else { "main" };
     let width = unsafe { (*video_stream.parameters().as_ptr()).width };
     let height = unsafe { (*video_stream.parameters().as_ptr()).height };
 
+    let pipeline_desc = match (mode, cpu_codec) {
+        (TranscodeMode::Gpu, _) => format!("scale_cuda → {scale_format} | hevc_nvenc ({profile})"),
+        (TranscodeMode::Cpu, CpuCodec::Hevc) => format!("format → {scale_format} | libx265 ({profile})"),
+        (TranscodeMode::Cpu, CpuCodec::Av1) => format!("format → {scale_format} | libsvtav1"),
+    };
     println!(
-        "   Source pixel format: {} ({} bit) | scale_cuda → {} | profile: {}",
+        "   Source pixel format: {} ({} bit) | {}",
         src_pix_name,
         if is_10bit { "10" } else { "8" },
-        scale_format,
-        profile
+        pipeline_desc
     );
     println!("   Saving to: {:?}", output);
 
@@ -165,13 +250,19 @@ fn process_video(input: &Path, output: &Path) -> Result<()> {
         ist_time_bases[ist_index] = ist.time_base();
 
         if ist_index == vindex {
-            // Re-encode the (best) video stream with NVENC.
-            let mut pipe = VideoPipeline::new(&ist, ost_index, width, height, &src_pix_name)?;
+            // Re-encode the (best) video stream (NVENC on GPU, libx265/svtav1 on CPU).
+            let mut pipe =
+                VideoPipeline::new(&ist, ost_index, width, height, &src_pix_name, mode, cpu_codec)?;
             pipe.input_time_base = video_stream_tb;
             pipeline = Some(pipe);
 
             // Reserve the output slot now; `prepare()` fills it in.
-            let mut v_ost = octx.add_stream(ffmpeg::encoder::find_by_name("hevc_nvenc"))?;
+            let reserve_codec = match (mode, cpu_codec) {
+                (TranscodeMode::Gpu, _) => "hevc_nvenc",
+                (TranscodeMode::Cpu, CpuCodec::Hevc) => "libx265",
+                (TranscodeMode::Cpu, CpuCodec::Av1) => "libsvtav1",
+            };
+            let mut v_ost = octx.add_stream(ffmpeg::encoder::find_by_name(reserve_codec))?;
             unsafe {
                 (*(*v_ost.as_mut_ptr()).codecpar).codec_tag = 0;
             }
@@ -213,7 +304,9 @@ fn process_video(input: &Path, output: &Path) -> Result<()> {
                 match pipe.decoder.receive_frame(&mut first) {
                     Ok(()) => {
                         primed = true;
-                        ensure_cuda_frame(&first)?;
+                        if mode == TranscodeMode::Gpu {
+                            ensure_cuda_frame(&first)?;
+                        }
                         pipe.prepare(&mut octx, global_header)?;
                         write_header_and_replay(
                             &mut octx,
@@ -261,7 +354,9 @@ fn process_video(input: &Path, output: &Path) -> Result<()> {
             let mut first = frame::Video::empty();
             match pipe.decoder.receive_frame(&mut first) {
                 Ok(()) => {
-                    ensure_cuda_frame(&first)?;
+                    if mode == TranscodeMode::Gpu {
+                        ensure_cuda_frame(&first)?;
+                    }
                     pipe.prepare(&mut octx, global_header)?;
                     write_header_and_replay(
                         &mut octx,
@@ -377,6 +472,9 @@ struct VideoPipeline {
     height: i32,
     input_time_base: Rational,
 
+    mode: TranscodeMode,
+    cpu_codec: CpuCodec,
+
     ost_index: usize,
     prepared: bool,
 
@@ -395,39 +493,52 @@ impl VideoPipeline {
         width: i32,
         height: i32,
         src_pix_name: &str,
+        mode: TranscodeMode,
+        cpu_codec: CpuCodec,
     ) -> Result<Self> {
         let is_10bit = is_10bit_pix_fmt(src_pix_name);
-        let scale_format = if is_10bit { "p010le" } else { "nv12" };
+        let scale_format = match (mode, is_10bit) {
+            (TranscodeMode::Gpu, true) => "p010le",
+            (TranscodeMode::Gpu, false) => "nv12",
+            (TranscodeMode::Cpu, true) => "yuv420p10le",
+            (TranscodeMode::Cpu, false) => "yuv420p",
+        };
         let profile = if is_10bit { "main10" } else { "main" };
 
-        // ---- CUDA hardware device + hwaccel decoder -----------------------
-        let mut device: *mut AVBufferRef = ptr::null_mut();
-        let ret = unsafe {
-            av_hwdevice_ctx_create(
-                &mut device,
-                AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            )
+        let mut decoder = codec::context::Context::from_parameters(ist.parameters())?.decoder();
+
+        let (device, video) = if mode == TranscodeMode::Gpu {
+            // ---- CUDA hardware device + hwaccel decoder -----------------------
+            let mut device: *mut AVBufferRef = ptr::null_mut();
+            let ret = unsafe {
+                av_hwdevice_ctx_create(
+                    &mut device,
+                    AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if ret < 0 || device.is_null() {
+                bail!(
+                    "could not create CUDA hw device (error {ret}): is a CUDA-capable \
+                     NVIDIA GPU with current drivers available?"
+                );
+            }
+
+            unsafe {
+                let avctx = decoder.as_mut_ptr();
+                (*avctx).hw_device_ctx = av_buffer_ref(device);
+                (*avctx).get_format = Some(cuda_get_format);
+            }
+
+            let video = decoder.video()?;
+            (device, video)
+        } else {
+            // ---- software decoder (CPU fallback) ------------------------------
+            let video = decoder.video()?;
+            (ptr::null_mut(), video)
         };
-        if ret < 0 || device.is_null() {
-            bail!(
-                "could not create CUDA hw device (error {ret}): is a CUDA-capable \
-                 NVIDIA GPU with current drivers available?"
-            );
-        }
-
-        let mut decoder =
-            codec::context::Context::from_parameters(ist.parameters())?.decoder();
-
-        unsafe {
-            let avctx = decoder.as_mut_ptr();
-            (*avctx).hw_device_ctx = av_buffer_ref(device);
-            (*avctx).get_format = Some(cuda_get_format);
-        }
-
-        let video = decoder.video()?;
 
         Ok(Self {
             decoder: video,
@@ -441,6 +552,8 @@ impl VideoPipeline {
             width,
             height,
             input_time_base: ist.time_base(),
+            mode,
+            cpu_codec,
             ost_index,
             prepared: false,
             frame_count: 0,
@@ -453,7 +566,14 @@ impl VideoPipeline {
     /// fills in the output stream that `process_video` reserved.
     fn prepare(&mut self, octx: &mut format::context::Output, global_header: bool) -> Result<()> {
         assert!(!self.prepared, "prepare() called twice");
+        match self.mode {
+            TranscodeMode::Gpu => self.prepare_gpu(octx, global_header),
+            TranscodeMode::Cpu => self.prepare_cpu(octx, global_header),
+        }
+    }
 
+    /// GPU path: CUDA frames through `scale_cuda` into an NVENC encoder.
+    fn prepare_gpu(&mut self, octx: &mut format::context::Output, global_header: bool) -> Result<()> {
         // The decoder allocated its hardware frames context when the first
         // frame was decoded; the filter source must use that same pool.
         let dec_hw_frames: *mut AVBufferRef = unsafe { (*self.decoder.as_mut_ptr()).hw_frames_ctx };
@@ -623,6 +743,182 @@ impl VideoPipeline {
             let opened_encoder = encoder
                 .open_with(opts)
                 .context("failed to open hevc_nvenc with the requested options")?;
+
+            {
+                let mut ost = octx
+                    .stream_mut(self.ost_index)
+                    .ok_or_else(|| anyhow!("video output stream disappeared"))?;
+                ost.set_parameters(&opened_encoder);
+            }
+
+            self.graph = graph;
+            self.src = src;
+            self.sink = sink;
+            self.encoder = Some(opened_encoder);
+        }
+
+        self.prepared = true;
+        Ok(())
+    }
+
+    /// CPU path: software frames through a `format` filter (pixel format
+    /// conversion) into a libx265/libsvtav1 encoder. Same carrier logic as the
+    /// GPU path — the subtle parts here are that the software decoder's
+    /// *actual* pixel format must be given to the buffer source, and the
+    /// `format` filter converts it to what the encoder wants.
+    fn prepare_cpu(&mut self, octx: &mut format::context::Output, global_header: bool) -> Result<()> {
+        let mut graph = unsafe { avfilter_graph_alloc() };
+        if graph.is_null() {
+            bail!("out of memory allocating filter graph");
+        }
+
+        let src: *mut AVFilterContext;
+        let mut fmt: *mut AVFilterContext = ptr::null_mut();
+        let mut sink: *mut AVFilterContext = ptr::null_mut();
+
+        unsafe {
+            let buffer_f = avfilter_get_by_name(c"buffer".as_ptr());
+            let format_f = avfilter_get_by_name(c"format".as_ptr());
+            let buffersink_f = avfilter_get_by_name(c"buffersink".as_ptr());
+            if buffer_f.is_null() || format_f.is_null() || buffersink_f.is_null() {
+                avfilter_graph_free(&mut graph);
+                bail!(
+                    "this FFmpeg build lacks one of the required filters \
+                     (buffer / format / buffersink)"
+                );
+            }
+
+            // ---- buffer source ---------------------------------------------
+            src = avfilter_graph_alloc_filter(graph, buffer_f, c"in".as_ptr());
+            if src.is_null() {
+                avfilter_graph_free(&mut graph);
+                bail!("out of memory allocating the `buffer` filter");
+            }
+
+            let params = av_buffersrc_parameters_alloc();
+            if params.is_null() {
+                avfilter_graph_free(&mut graph);
+                bail!("out of memory allocating buffer source parameters");
+            }
+            // The software decoder's actual output pixel format.
+            (*params).format = (*self.decoder.as_ptr()).pix_fmt as c_int;
+            (*params).time_base = self.input_time_base.into();
+            (*params).width = self.width;
+            (*params).height = self.height;
+
+            let sar = self.decoder.aspect_ratio();
+            if sar.numerator() > 0 && sar.denominator() > 0 {
+                (*params).sample_aspect_ratio = sar.into();
+            }
+            if let Some(framerate) = self.decoder.frame_rate() {
+                (*params).frame_rate = framerate.into();
+            }
+
+            // Match the colorspace/range the decoder derived from the stream
+            // headers (av_buffersrc_parameters_set ignores UNSPECIFIED values).
+            (*params).color_space = (*self.decoder.as_ptr()).colorspace;
+            (*params).color_range = (*self.decoder.as_ptr()).color_range;
+
+            let ret = av_buffersrc_parameters_set(src, params);
+            av_free(params as *mut std::os::raw::c_void);
+            if ret < 0 {
+                avfilter_graph_free(&mut graph);
+                bail!("av_buffersrc_parameters_set failed (error {ret})");
+            }
+
+            let ret = avfilter_init_dict(src, ptr::null_mut());
+            if ret < 0 {
+                avfilter_graph_free(&mut graph);
+                bail!("buffer filter initialization failed (error {ret})");
+            }
+
+            let scale_args = CString::new(format!("pix_fmts={}", self.scale_format)).unwrap();
+            check_graph_filter_alloc(
+                avfilter_graph_create_filter(
+                    &mut fmt,
+                    format_f,
+                    c"format".as_ptr(),
+                    scale_args.as_ptr(),
+                    ptr::null_mut(),
+                    graph,
+                ),
+                "format",
+                &mut graph,
+                &mut self.device,
+            )?;
+            check_graph_filter_alloc(
+                avfilter_graph_create_filter(
+                    &mut sink,
+                    buffersink_f,
+                    c"out".as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    graph,
+                ),
+                "buffersink",
+                &mut graph,
+                &mut self.device,
+            )?;
+
+            avfilter_link(src, 0, fmt, 0);
+            avfilter_link(fmt, 0, sink, 0);
+
+            let ret = avfilter_graph_config(graph, ptr::null_mut());
+            if ret < 0 {
+                avfilter_graph_free(&mut graph);
+                bail!("filter graph configuration failed (error {ret})");
+            }
+
+            // ---- libx265 / libsvtav1 encoder -------------------------------
+            let encoder_name = match self.cpu_codec {
+                CpuCodec::Hevc => "libx265",
+                CpuCodec::Av1 => "libsvtav1",
+            };
+            let encoder_codec = ffmpeg::encoder::find_by_name(encoder_name)
+                .ok_or_else(|| anyhow!("{encoder_name} encoder not found in this FFmpeg build"))?;
+
+            let mut encoder =
+                codec::context::Context::new_with_codec(encoder_codec).encoder().video()?;
+
+            encoder.set_width(self.decoder.width());
+            encoder.set_height(self.decoder.height());
+            encoder.set_format(if self.scale_format == "yuv420p10le" {
+                ffmpeg::util::format::Pixel::YUV420P10LE
+            } else {
+                ffmpeg::util::format::Pixel::YUV420P
+            });
+            encoder.set_aspect_ratio(self.decoder.aspect_ratio());
+            if let Some(framerate) = self.decoder.frame_rate() {
+                encoder.set_frame_rate(Some(framerate));
+            } else {
+                // Fall back to the inverse of the stream time base.
+                let tb = self.input_time_base;
+                encoder.set_frame_rate(Some(Rational(tb.denominator(), tb.numerator())));
+            }
+            encoder.set_time_base(self.input_time_base);
+
+            if global_header {
+                encoder.set_flags(codec::Flags::GLOBAL_HEADER);
+            }
+
+            let mut opts = Dictionary::new();
+            match self.cpu_codec {
+                CpuCodec::Hevc => {
+                    opts.set("preset", "slow");
+                    opts.set("crf", "22");
+                    opts.set("profile", self.profile.as_str());
+                    // Keep x265's banner/statistics spam out of the batch log.
+                    opts.set("x265-params", "log-level=error");
+                }
+                CpuCodec::Av1 => {
+                    opts.set("preset", "6");
+                    opts.set("crf", "32");
+                }
+            }
+
+            let opened_encoder = encoder.open_with(opts).with_context(|| {
+                format!("failed to open {encoder_name} with the requested options")
+            })?;
 
             {
                 let mut ost = octx
@@ -821,6 +1117,28 @@ fn ensure_cuda_frame(frame: &frame::Video) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Probes whether a CUDA-capable NVIDIA GPU is available by asking FFmpeg to
+/// create a CUDA hardware device. Returns `Ok(false)` — not an error — when no
+/// such device is present, so the caller can fall back to the CPU pipeline.
+fn cuda_device_available() -> Result<bool> {
+    let mut device: *mut AVBufferRef = ptr::null_mut();
+    let ret = unsafe {
+        av_hwdevice_ctx_create(
+            &mut device,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            ptr::null(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if ret >= 0 && !device.is_null() {
+        unsafe { av_buffer_unref(&mut device) };
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Reads the pixel format name of the first video stream from its codec
