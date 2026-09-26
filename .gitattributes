@@ -1,3 +1,9 @@
 # Shell scripts must stay LF, otherwise they break on macOS/Linux
 # even when checked out on Windows (core.autocrlf).
 *.sh text eol=lf
+
+# The justfile is parsed line by line and a stray CR breaks recipe bodies.
+justfile text eol=lf
+
+# PowerShell is happy either way, but CRLF is the convention on Windows.
+*.ps1 text eol=crlf

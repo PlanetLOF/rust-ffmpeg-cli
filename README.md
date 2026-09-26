@@ -28,13 +28,14 @@ The encoding profile adapts to the source bit depth:
   - Example (Windows): the [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases) `ffmpeg-n8.1.3-win64-gpl-shared-8.1` zip, unzipped somewhere, with the path exported as `FFMPEG_DIR` (points at the folder containing `include/`, `lib/`, `bin/`).
 - **libclang** for `bindgen` (used by `ffmpeg-sys-next`), exported as `LIBCLANG_PATH` (e.g. the `clang\native` folder inside a Python `clang` package).
 - A CUDA-capable NVIDIA GPU with current drivers (used when present; without one the tool falls back to software encoding).
+- [`just`](https://github.com/casey/just) — optional, only for the [`just build` / `just package`](#packaging) shortcuts. `cargo build --release` works on its own.
 
 Windows example:
 
 ```powershell
 $env:FFMPEG_DIR   = 'C:\path\to\ffmpeg-n8.1.3-win64-gpl-shared-8.1'
 $env:LIBCLANG_PATH = 'C:\path\to\clang\native'
-cargo build --release
+just build        # or: cargo build --release
 ```
 
 ### Runtime
@@ -45,11 +46,107 @@ When using the shared-library build of FFmpeg, the accompanying `bin/` directory
 $env:PATH = 'C:\path\to\ffmpeg-n8.1.3-win64-gpl-shared-8.1\bin;' + $env:PATH
 ```
 
-Or, to bundle the libraries with the executable, run:
+Or, to bundle the libraries with the executable so it runs without any
+environment set up, run:
 - Windows: `copy-dlls.ps1` (copies the required DLLs from `$env:FFMPEG_DIR\bin` into `target\release`)
 - macOS / Linux: `copy-dlls.sh` (run as `bash copy-dlls.sh`, or `chmod +x` it first) — copies `libavcodec`/`libavformat`/`libavfilter`/`libavutil`/`libswresample`/`libswscale` from `$FFMPEG_DIR\lib`; on macOS it also re-points the dylibs' install names to `@loader_path` so no original install is needed)
 
 Both accept `-SourceDir`/`-TargetDir` (or `--source`/`--target`) to override.
+
+See [Packaging](#packaging) for turning that into a distributable archive.
+
+## Packaging
+
+`just` drives the build and the packaging; [`just`](https://github.com/casey/just)
+is the only extra tool required (`cargo install just`, `brew install just`, or
+`winget install Casey.Just` on Windows).
+
+| Command | What it does |
+|---------|--------------|
+| `just` | list the recipes |
+| `just build` | `cargo build --release` |
+| `just libs` | copy the FFmpeg shared libraries next to the dev binary in `target/` |
+| `just package` | build, stage a bundle, verify it runs, archive it into `dist/` |
+| `just smoke` | re-verify the bundle that is already staged, rebuild nothing |
+| `just fmt` | format the Rust sources (`cargo fmt`) |
+| `just clean` | remove the staging directory and `dist/` |
+
+```bash
+FFMPEG_DIR=/path/to/ffmpeg-dev just package
+# dist/rust-ffmpeg-cli-0.1.0-linux-x64.tar.gz
+```
+
+`just package` runs entirely on the host it is invoked on — there is no
+cross-compilation, since the bundle has to pick up FFmpeg libraries and (on the
+GPU path) a CUDA stack built for that platform. Build a macOS bundle on macOS
+and a Windows one on Windows. To pick the target triple explicitly, pass it the
+way cargo does:
+
+```bash
+TARGET=aarch64-unknown-linux-gnu just package
+```
+
+### Bundle layout
+
+The archive is **flat** — every entry sits at its root, so extracting needs no
+cleanup:
+
+| Linux / macOS | Windows | What it is |
+|---------------|---------|------------|
+| `rust-ffmpeg-cli.sh` | — | launcher; sets the library path and execs `.bin` |
+| `rust-ffmpeg-cli.bin` | `rust-ffmpeg-cli.exe` | the real compiled binary |
+| `libav*.so*` / `*.dylib` | `av*-62.dll`, … | the FFmpeg shared libraries |
+
+On Windows no launcher is needed: the loader always searches the exe's own
+directory before `PATH`, so the binary and the DLLs beside it are enough. On
+Linux and macOS there is no such default, hence `rust-ffmpeg-cli.sh`, which
+exports `LD_LIBRARY_PATH` (Linux) or `DYLD_LIBRARY_PATH` (macOS) for its own
+directory before exec'ing the binary. This keeps the compiled binary free of a
+baked-in rpath, and the tarball needs no system-wide setup to run:
+
+```bash
+tar -xzf rust-ffmpeg-cli-0.1.0-linux-x64.tar.gz
+./rust-ffmpeg-cli.sh -i video.mp4
+```
+
+The same launcher also works in the development tree, where the binary is
+still called `rust-ffmpeg-cli` (it falls back to that name), so no renaming is
+needed:
+
+```bash
+just libs
+./target/release/rust-ffmpeg-cli.sh -i video.mp4
+```
+
+### Verification
+
+`just package` refuses to produce an archive until the staged bundle has
+actually started, with both library-path variables scrubbed so that an FFmpeg
+installed system-wide cannot stand in for a library missing from the bundle:
+
+```
+$ just package
+cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.09s
+bash package.sh
+Copied 6 library set(s) from '/path/to/ffmpeg/lib' to '.../target/package'
+rust-ffmpeg-cli 0.1.0
+OK: bundle starts and reports its version (library path scrubbed)
+
+Packaged .../dist/rust-ffmpeg-cli-0.1.0-linux-x64.tar.gz
+  20 files, 199M staged
+  entry point: ./rust-ffmpeg-cli.sh -i <input>
+```
+
+Note that the archives are not byte-reproducible: `tar` and `gzip` record file
+modification times, which differ per run. The *contents* are identical.
+
+`package.sh` / `package.ps1` can also be run directly, without `just`:
+
+```bash
+bash package.sh --source /path/to/ffmpeg/lib --out-dir /tmp/out
+pwsh ./package.ps1 -SourceDir C:\path\to\ffmpeg\bin
+```
 
 ## Usage
 
