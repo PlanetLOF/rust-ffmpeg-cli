@@ -164,6 +164,8 @@ rust-ffmpeg-cli [OPTIONS] --inputs <INPUTS>...
 | `-s` | `--suffix` | `_enc` | Custom suffix appended to the input file name |
 | `--mode` | `--mode` | `auto` | Encoding mode: `auto` (probe for NVIDIA/CUDA), `cuda` (force GPU), `cpu` (force software) |
 | `--cpu-codec` | `--cpu-codec` | `hevc` | Software encoder used in CPU mode: `hevc` (libx265) or `av1` (libsvtav1) |
+| `--progress-interval` | `--progress-interval` | `1.0` | Seconds between progress updates while encoding (`0` disables them) |
+| `--no-progress` | `--no-progress` | | Silence the per-interval progress lines (only the end-of-file summary remains) |
 | `-h` | `--help` | | Print help |
 | `-V` | `--version` | | Print version |
 
@@ -212,6 +214,24 @@ Output files follow the pattern:
 ```
 
 Where `{base_dir}` defaults to `output` (relative to the current working directory) unless overridden with `-o`. For example, with defaults: `movies/movie.mp4` becomes `output/movies/movie_enc.mkv`.
+
+### Progress reporting
+
+While a file is being encoded, one line is printed per interval (stderr, one second by default) with the frame counter, how far into the source the pipeline is, the encode speed and the estimated time left:
+
+```
+⏱ frame 1366/1800 (75.8%) | 1.88x realtime | 57 fps | elapsed 00:24 | ETA 00:08
+```
+
+- `x realtime` is media seconds per wall second — how many times faster than realtime the encode runs — and `fps` is the throughput over the last interval. Speed and ETA come from the decoded frames' presentation timestamps, so variable frame rate sources are handled.
+- The percentage and `ETA` need a source duration; when the container reports none they are dropped and only the frame counter, speed and elapsed time remain.
+- Change the cadence with `--progress-interval 5`, or silence the lines with `--no-progress` (the end-of-file summary still prints).
+
+When a file finishes, a summary line reports the total frames, wall time, average speed and the size of the output:
+
+```
+⏱ done: 1800 frames in 00:32 — 1.88x realtime (avg 56 fps) → output/movies/movie_enc.mkv (17.5 MiB)
+```
 
 ## How it works
 

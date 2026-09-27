@@ -59,6 +59,14 @@ struct Args {
     /// Software encoder codec used when running in CPU mode
     #[arg(long, value_enum, default_value_t = CpuCodec::Hevc)]
     cpu_codec: CpuCodec,
+
+    /// Seconds between progress updates while encoding (0 disables them)
+    #[arg(long, value_name = "SECS")]
+    progress_interval: Option<f64>,
+
+    /// Silence the per-interval progress lines
+    #[arg(long, conflicts_with = "progress_interval")]
+    no_progress: bool,
 }
 
 /// CLI choices for the encoding pipeline.
@@ -142,6 +150,13 @@ fn main() -> Result<()> {
     }
 
     // 2. Process the gathered files
+    // How often to print the encode progress line; 0 means "never".
+    let progress_interval = if args.no_progress {
+        0.0
+    } else {
+        args.progress_interval.unwrap_or(1.0).max(0.0)
+    };
+
     for input_path in files_to_process {
         // Determine the output directory dynamically:
         let base_dir = match &args.output_dir {
@@ -162,7 +177,13 @@ fn main() -> Result<()> {
             build_output_path(&input_path, &target_dir, &args.suffix, &args.extension);
 
         println!("\n🎬 Processing: {:?}", input_path);
-        match process_video(&input_path, &output_path, mode, args.cpu_codec) {
+        match process_video(
+            &input_path,
+            &output_path,
+            mode,
+            args.cpu_codec,
+            progress_interval,
+        ) {
             Ok(()) => println!("✅ Successfully encoded: {:?}", output_path),
             Err(e) => eprintln!("❌ Failed to encode {:?}:\n   {:#}", input_path, e),
         }
@@ -178,6 +199,7 @@ fn process_video(
     output: &Path,
     mode: TranscodeMode,
     cpu_codec: CpuCodec,
+    progress_interval: f64,
 ) -> Result<()> {
     let mut ictx = format::input(input)
         .with_context(|| format!("could not open input `{}`", input.display()))?;
@@ -188,6 +210,10 @@ fn process_video(
         .ok_or_else(|| anyhow!("no video stream found"))?;
     let vindex = video_stream.index();
     let video_stream_tb = video_stream.time_base();
+
+    // Total source duration, used by the progress line to show a percentage and
+    // an ETA. `0.0` when the container does not report one.
+    let total_duration = source_duration_secs(&ictx, &video_stream);
 
     // Detect the source bit depth and pick the scale output format and codec
     // profile accordingly. On the GPU path that is NVENC's nv12/p010le (the 8->10
@@ -257,11 +283,15 @@ fn process_video(
             let mut pipe = VideoPipeline::new(
                 &ist,
                 ost_index,
-                width,
-                height,
-                &src_pix_name,
-                mode,
-                cpu_codec,
+                PipelineConfig {
+                    src_pix_name: &src_pix_name,
+                    width,
+                    height,
+                    mode,
+                    cpu_codec,
+                    total_secs: total_duration,
+                    progress_interval,
+                },
             )?;
             pipe.input_time_base = video_stream_tb;
             pipeline = Some(pipe);
@@ -399,7 +429,30 @@ fn process_video(
         &mut ost_time_bases,
     )?;
     octx.write_trailer()?;
+
+    // Per-file summary: frames, wall time, average speed and output size.
+    // Printed after the trailer so the size on disk is final.
+    if let Some(summary) = pipeline
+        .as_ref()
+        .and_then(|pipe| pipe.progress.summary_line(output))
+    {
+        println!("{summary}");
+    }
     Ok(())
+}
+
+/// Best-effort total duration of the input in seconds, for the progress line's
+/// percentage and ETA. `0.0` when neither the container nor the stream reports
+/// one.
+fn source_duration_secs(ictx: &format::context::Input, stream: &format::stream::Stream) -> f64 {
+    if ictx.duration() > 0 {
+        return ictx.duration() as f64 / AV_TIME_BASE as f64;
+    }
+    let tb = stream.time_base();
+    if stream.duration() > 0 && tb.denominator() > 0 {
+        return stream.duration() as f64 * tb.numerator() as f64 / tb.denominator() as f64;
+    }
+    0.0
 }
 
 /// Writes the muxer header (once), records the output streams' time bases
@@ -460,6 +513,22 @@ fn write_copied_packet(
     Ok(())
 }
 
+/// Per-file settings for `VideoPipeline`, bundled so the constructor stays
+/// readable.
+struct PipelineConfig<'a> {
+    /// Pixel format name of the source stream, decides the scale output format
+    /// and the encoder profile.
+    src_pix_name: &'a str,
+    width: i32,
+    height: i32,
+    mode: TranscodeMode,
+    cpu_codec: CpuCodec,
+    /// Total source duration in seconds; `0.0` when unknown.
+    total_secs: f64,
+    /// Seconds between progress status lines; `0.0` disables them.
+    progress_interval: f64,
+}
+
 /// Everything needed to transcode one video stream through the GPU pipeline.
 struct VideoPipeline {
     decoder: codec::decoder::Video,
@@ -486,8 +555,10 @@ struct VideoPipeline {
     ost_index: usize,
     prepared: bool,
 
-    frame_count: usize,
-    last_log: Instant,
+    /// Periodic progress reporting (media position, wall time, speed).
+    progress: EncodeProgress,
+    /// Nominal frame rate (fps), used to place frames that carry no PTS.
+    fps: f64,
 }
 
 impl VideoPipeline {
@@ -498,12 +569,17 @@ impl VideoPipeline {
     fn new(
         ist: &format::stream::Stream,
         ost_index: usize,
-        width: i32,
-        height: i32,
-        src_pix_name: &str,
-        mode: TranscodeMode,
-        cpu_codec: CpuCodec,
+        cfg: PipelineConfig<'_>,
     ) -> Result<Self> {
+        let PipelineConfig {
+            src_pix_name,
+            width,
+            height,
+            mode,
+            cpu_codec,
+            total_secs,
+            progress_interval,
+        } = cfg;
         let is_10bit = is_10bit_pix_fmt(src_pix_name);
         let scale_format = match (mode, is_10bit) {
             (TranscodeMode::Gpu, true) => "p010le",
@@ -512,6 +588,24 @@ impl VideoPipeline {
             (TranscodeMode::Cpu, false) => "yuv420p",
         };
         let profile = if is_10bit { "main10" } else { "main" };
+
+        // Nominal frame rate, the fallback for progress reporting on streams
+        // whose frames carry no timestamp.
+        let avg = ist.avg_frame_rate();
+        let fps = if avg.numerator() > 0 && avg.denominator() > 0 {
+            avg.numerator() as f64 / avg.denominator() as f64
+        } else {
+            0.0
+        };
+        // Total frame count for the progress line: the container's count when it
+        // has one, otherwise derived from the duration and frame rate.
+        let total_frames = if ist.frames() > 0 {
+            ist.frames() as u64
+        } else if total_secs > 0.0 && fps > 0.0 {
+            (total_secs * fps).round() as u64
+        } else {
+            0
+        };
 
         let mut decoder = codec::context::Context::from_parameters(ist.parameters())?.decoder();
 
@@ -564,8 +658,8 @@ impl VideoPipeline {
             cpu_codec,
             ost_index,
             prepared: false,
-            frame_count: 0,
-            last_log: Instant::now(),
+            progress: EncodeProgress::new(total_secs, total_frames, progress_interval),
+            fps,
         })
     }
 
@@ -963,6 +1057,7 @@ impl VideoPipeline {
         frame: &mut frame::Video,
         ost_time_base: Rational,
     ) -> Result<()> {
+        self.progress.record(self.frame_position(frame));
         let ret = unsafe { av_buffersrc_add_frame(self.src, frame.as_mut_ptr()) };
         if ret < 0 {
             bail!("av_buffersrc_add_frame failed (error {ret})");
@@ -979,15 +1074,31 @@ impl VideoPipeline {
     ) -> Result<()> {
         let mut frame = frame::Video::empty();
         while self.decoder.receive_frame(&mut frame).is_ok() {
-            self.frame_count += 1;
+            self.progress.record(self.frame_position(&frame));
             let ret = unsafe { av_buffersrc_add_frame(self.src, frame.as_mut_ptr()) };
             if ret < 0 {
                 bail!("av_buffersrc_add_frame failed (error {ret})");
             }
             self.drain_filter_to_encoder(octx, ost_time_base)?;
-            self.log_progress();
+            self.progress.tick();
         }
         Ok(())
+    }
+
+    /// Presentation position of a decoded frame in seconds, used for the
+    /// progress percentage/ETA. Falls back to the frame count and the nominal
+    /// frame rate when the frame carries no timestamp.
+    fn frame_position(&self, frame: &frame::Video) -> f64 {
+        if let Some(pts) = frame.pts() {
+            let tb = self.input_time_base;
+            if tb.denominator() > 0 {
+                return pts as f64 * tb.numerator() as f64 / tb.denominator() as f64;
+            }
+        }
+        if self.fps > 0.0 {
+            return self.progress.frames as f64 / self.fps;
+        }
+        self.progress.position
     }
 
     /// Flushes the decoder, filter graph and encoder at end of stream.
@@ -1049,13 +1160,6 @@ impl VideoPipeline {
     fn encoder_mut(&mut self) -> &mut codec::encoder::Video {
         self.encoder.as_mut().expect("encoder not prepared")
     }
-
-    fn log_progress(&mut self) {
-        if self.last_log.elapsed().as_secs_f64() >= 1.0 {
-            eprintln!("   ... decoded {} frames", self.frame_count);
-            self.last_log = Instant::now();
-        }
-    }
 }
 
 impl Drop for VideoPipeline {
@@ -1070,6 +1174,179 @@ impl Drop for VideoPipeline {
             // The decoder (with its hw_frames_ctx / hw_device_ctx refs) and the
             // encoder are owned by their Rust wrappers and freed afterwards.
         }
+    }
+}
+
+/// Periodic encode-progress reporting: it tracks how far into the source the
+/// pipeline is and how much wall-clock time that took, and turns both into the
+/// speed / ETA figures printed once per `interval`.
+struct EncodeProgress {
+    /// Wall clock when the first frame was handed to the encoder.
+    start: Instant,
+    /// Wall clock of the previous status line (for the interval fps).
+    last_instant: Instant,
+    /// Frame count at the previous status line (for the interval fps).
+    last_frames: u64,
+    /// Presentation position of the newest frame, in seconds.
+    position: f64,
+    /// Total source duration in seconds; `0.0` when unknown.
+    total: f64,
+    /// Total source frame count; `0` when unknown.
+    total_frames: u64,
+    /// Frames handed to the filter graph so far.
+    frames: u64,
+    /// Seconds between status lines; `0.0` disables progress output.
+    interval: f64,
+}
+
+impl EncodeProgress {
+    /// `total`/`total_frames` are `0` when the source does not report them; the
+    /// progress clock starts with the first recorded frame (see `record`).
+    fn new(total: f64, total_frames: u64, interval: f64) -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last_instant: now,
+            last_frames: 0,
+            position: 0.0,
+            total,
+            total_frames,
+            frames: 0,
+            interval,
+        }
+    }
+
+    /// Records one frame reaching the encoder at media position `pos` seconds.
+    fn record(&mut self, pos: f64) {
+        if self.frames == 0 {
+            // Start the clock with the first frame, so waiting for the first
+            // packet and setting up decoder/graph/encoder is not billed as
+            // encode time.
+            self.start = Instant::now();
+            self.last_instant = self.start;
+        }
+        self.frames += 1;
+        if pos > self.position {
+            self.position = pos;
+        }
+    }
+
+    /// Prints a status line (frame count, speed, elapsed time, ETA) once the
+    /// update interval has elapsed. Does nothing when progress is disabled.
+    fn tick(&mut self) {
+        if self.interval <= 0.0 {
+            return;
+        }
+        let now = Instant::now();
+        let since_last = now.duration_since(self.last_instant).as_secs_f64();
+        if since_last < self.interval {
+            return;
+        }
+
+        let wall = now.duration_since(self.start).as_secs_f64();
+        // Media seconds per wall second, i.e. how many times faster than
+        // realtime the encode is running.
+        let speed = if self.position > 0.0 && wall > 0.0 {
+            self.position / wall
+        } else {
+            0.0
+        };
+        let fps = if since_last > 0.0 {
+            (self.frames.saturating_sub(self.last_frames) as f64) / since_last
+        } else {
+            0.0
+        };
+
+        // Progress percentage: from the media position when the duration is
+        // known, otherwise from the frame count.
+        let fraction = if self.total > 0.0 {
+            Some((self.position / self.total).clamp(0.0, 1.0))
+        } else if self.total_frames > 0 {
+            Some((self.frames as f64 / self.total_frames as f64).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+
+        let mut parts = Vec::with_capacity(5);
+        parts.push(match fraction {
+            Some(f) => format!(
+                "frame {}/{} ({:.1}%)",
+                self.frames,
+                self.total_frames,
+                f * 100.0
+            ),
+            None => format!("frame {}", self.frames),
+        });
+        if speed > 0.0 {
+            parts.push(format!("{speed:.2}x realtime"));
+        }
+        if fps > 0.0 {
+            parts.push(format!("{fps:.0} fps"));
+        }
+        parts.push(format!("elapsed {}", format_duration(wall)));
+        if speed > 0.0 && self.total > 0.0 {
+            let remaining = (self.total - self.position).max(0.0);
+            parts.push(format!("ETA {}", format_duration(remaining / speed)));
+        }
+
+        eprintln!("   ⏱ {}", parts.join(" | "));
+
+        self.last_instant = now;
+        self.last_frames = self.frames;
+    }
+
+    /// The end-of-file summary: frames, wall time, average speed and the size
+    /// of the finished output. `None` when no frame was encoded.
+    fn summary_line(&self, output: &Path) -> Option<String> {
+        if self.frames == 0 {
+            return None;
+        }
+        let wall = self.start.elapsed().as_secs_f64();
+        let mut line = format!("   ⏱ done: {} frames", self.frames);
+        if wall > 0.0 {
+            line.push_str(&format!(" in {}", format_duration(wall)));
+            if self.position > 0.0 {
+                line.push_str(&format!(" — {:.2}x realtime", self.position / wall));
+            }
+            line.push_str(&format!(" (avg {:.0} fps)", self.frames as f64 / wall));
+        }
+        match std::fs::metadata(output) {
+            Ok(meta) => line.push_str(&format!(
+                " → {} ({})",
+                output.display(),
+                format_bytes(meta.len())
+            )),
+            Err(_) => line.push_str(&format!(" → {}", output.display())),
+        }
+        Some(line)
+    }
+}
+
+/// Formats a duration in seconds as `H:MM:SS`, dropping the hours when zero.
+fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Formats a byte count with binary units, e.g. `412.7 MiB`.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
